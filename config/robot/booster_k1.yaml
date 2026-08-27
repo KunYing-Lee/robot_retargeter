@@ -1,0 +1,198 @@
+robot_xml_path: "asset/robot/booster_k1/K1_22dof.xml"
+verbose: True
+render_debug: False
+keypoints_path: "output_data/keypoints/booster_k1/walk_forward_loop_002__A022_from_g1_keypoints.pkl"
+
+# K1's serial model has 22 actuated joints: two head joints, four joints per
+# arm, and six joints per leg. Keep the physical MJCF limits unchanged; the
+# source motion, rather than a synthetic offset, determines knee flexion.
+joints_limit_offset_degrees: {}
+knee_angle_offset_degrees: 0.0
+enable_knee_angle_offset_degrees: false
+
+# Semantic source links are represented by pairs of K1 body frames.  The
+# shoulder and arm endpoints match the G1 source semantics used by
+# robot_replay.py; K1's head is held by its two target head frames because the
+# AMP G1 source motion has no actuated head joints.
+# The hip anchors use K1's rest-frame offsets before propagating the source
+# thigh/calf motion. This preserves K1's real pelvis-to-hip geometry instead of
+# forcing G1's different fixed hip offset onto the target skeleton.
+target_rest_anchor_links: [left_hip, right_hip]
+
+robot_links:
+  left_hip: [Trunk, Left_Hip_Roll]
+  left_thigh: [Left_Hip_Roll, Left_Shank]
+  left_calf: [Left_Shank, left_foot_link]
+
+  right_hip: [Trunk, Right_Hip_Roll]
+  right_thigh: [Right_Hip_Roll, Right_Shank]
+  right_calf: [Right_Shank, right_foot_link]
+
+  neck: [Trunk, Head_1]
+  head: [Head_1, Head_2]
+
+  left_shoulder: [Head_1, Left_Arm_2]
+  left_arm: [Left_Arm_2, left_hand_link]
+  left_fore_arm: [left_hand_link, left_hand_end_link]
+
+  right_shoulder: [Head_1, Right_Arm_2]
+  right_arm: [Right_Arm_2, right_hand_link]
+  right_fore_arm: [right_hand_link, right_hand_end_link]
+
+# The foot-end and toe frames are massless semantic frames added to the K1
+# MJCF at the corresponding contact locations.  They let the generic contact
+# locking stage use the same six source contact channels as the G1 config.
+contact_links: [left_foot_end_link, left_toe_link,
+                right_foot_end_link, right_toe_link,
+                left_hand_end_link, right_hand_end_link]
+
+contact_vel_calculate_window: 6
+contact_vel_threshold: 0.5
+contact_height_threshold: 0.025
+contact_height_lpf_alpha: 0.15
+contact_pos_fixed_factor: 15.0
+
+# Resolve K1's redundant elbow solutions toward its neutral posture while the
+# arm endpoint tasks track the source motion. The target is model.qpos0, not a
+# frame-specific hard-coded pose, so this remains a general IK regularizer.
+posture_regularization:
+  enabled: true
+  gain: 1.0
+  lm_damping: 1.0
+  joint_costs:
+    ALeft_Shoulder_Pitch: 0.5
+    Left_Shoulder_Roll: 0.5
+    Left_Elbow_Pitch: 0.5
+    Left_Elbow_Yaw: 0.5
+    ARight_Shoulder_Pitch: 0.5
+    Right_Shoulder_Roll: 0.5
+    Right_Elbow_Pitch: 0.5
+    Right_Elbow_Yaw: 0.5
+
+# Enforce the physical floor as a unilateral kinematic constraint. Since root Z
+# translates every sole point equally, the solver-side projection is the unique
+# minimum displacement satisfying all four z_sole >= 0 inequalities.
+ground_nonpenetration:
+  enabled: true
+  bodies: [left_foot_end_link, left_toe_link,
+           right_foot_end_link, right_toe_link]
+  height: 0.0
+  tolerance: 1.0e-9
+
+ik_match_table: {
+  "hips_mean": ["Trunk", 100, 5],
+
+  "left_hip": ["Left_Hip_Roll", 0.0, 3.0],
+  "left_thigh": ["Left_Shank", 0.0, 3.0],
+  "left_calf": ["left_foot_link", 40, 5],
+
+  "right_hip": ["Right_Hip_Roll", 0.0, 3.0],
+  "right_thigh": ["Right_Shank", 0.0, 3.0],
+  "right_calf": ["right_foot_link", 40, 5],
+
+  "head": ["Head_2", 0.0, 0.5],
+
+  "left_shoulder": ["Left_Arm_2", 0.0, 1.0],
+  "left_arm": ["left_hand_link", 15.0, 0.0],
+  "left_fore_arm": ["left_hand_end_link", 20.0, 0.0],
+
+  "right_shoulder": ["Right_Arm_2", 0.0, 1.0],
+  "right_arm": ["right_hand_link", 15.0, 0.0],
+  "right_fore_arm": ["right_hand_end_link", 20.0, 0.0]
+}
+
+# K1's raw MuJoCo body frames are identity-oriented in the neutral pose.  The
+# maps below are the same canonical semantic-frame maps used by the G1 source;
+# using the same source/target maps makes a neutral G1 frame remain neutral on
+# K1 while still passing through the generic key-frame conversion path.
+key_frame_config:
+  hips_mean:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [0.0, 0.0, 1.0]
+      y: [1.0, 0.0, 0.0]
+      z: [0.0, 1.0, 0.0]
+  left_up_leg:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [0.0, 0.0, 1.0]
+      y: [1.0, 0.0, 0.0]
+      z: [0.0, 1.0, 0.0]
+  left_leg:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [0.0, 0.0, 1.0]
+      y: [1.0, 0.0, 0.0]
+      z: [0.0, 1.0, 0.0]
+  left_foot:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [0.0, 0.0, 1.0]
+      y: [1.0, 0.0, 0.0]
+      z: [0.0, 1.0, 0.0]
+  right_up_leg:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [0.0, 0.0, 1.0]
+      y: [1.0, 0.0, 0.0]
+      z: [0.0, 1.0, 0.0]
+  right_leg:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [0.0, 0.0, 1.0]
+      y: [1.0, 0.0, 0.0]
+      z: [0.0, 1.0, 0.0]
+  right_foot:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [0.0, 0.0, 1.0]
+      y: [1.0, 0.0, 0.0]
+      z: [0.0, 1.0, 0.0]
+  shoulder_mean:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [0.0, 0.0, 1.0]
+      y: [1.0, 0.0, 0.0]
+      z: [0.0, 1.0, 0.0]
+  left_arm:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [0.0, 0.0, 1.0]
+      y: [0.0, 1.0, 0.0]
+      z: [-1.0, 0.0, 0.0]
+  left_fore_arm:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [1.0, 0.0, 0.0]
+      y: [0.0, 1.0, 0.0]
+      z: [0.0, 0.0, 1.0]
+  left_hand:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [1.0, 0.0, 0.0]
+      y: [0.0, 1.0, 0.0]
+      z: [0.0, 0.0, 1.0]
+  right_arm:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [0.0, 0.0, 1.0]
+      y: [0.0, -1.0, 0.0]
+      z: [1.0, 0.0, 0.0]
+  right_fore_arm:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [-1.0, 0.0, 0.0]
+      y: [0.0, -1.0, 0.0]
+      z: [0.0, 0.0, 1.0]
+  right_hand:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [-1.0, 0.0, 0.0]
+      y: [0.0, -1.0, 0.0]
+      z: [0.0, 0.0, 1.0]
+  head:
+    offset_deg_xyz: [0.0, 0.0, 0.0]
+    axis_map_cols:
+      x: [0.0, 0.0, 1.0]
+      y: [1.0, 0.0, 0.0]
+      z: [0.0, 1.0, 0.0]

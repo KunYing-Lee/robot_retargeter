@@ -524,6 +524,7 @@ def build_robot_retarget_keypoints(
 	target_robot_link_lengths: dict[str, float],
 	source_robot_config_path: Path,
 	target_robot_config_path: Path,
+	target_robot_mjcf_path: Path,
 ) -> tuple[
 		np.ndarray,
 		np.ndarray,
@@ -599,6 +600,69 @@ def build_robot_retarget_keypoints(
 			euler_offset,
 		)
 		ordered_quaternions[:, keypoint_idx, :] = ordered_raw_quaternions[:, keypoint_idx, :]
+
+	with target_robot_config_path.open("r", encoding="utf-8") as f:
+		target_config = yaml.safe_load(f) or {}
+	raw_target_rest_anchor_links = target_config.get("target_rest_anchor_links", [])
+	if not isinstance(raw_target_rest_anchor_links, list):
+		raise ValueError(
+			"target_rest_anchor_links must be a list of robot_links names in "
+			f"{target_robot_config_path}"
+		)
+	target_rest_anchor_links = tuple(
+		str(link_name).strip()
+		for link_name in raw_target_rest_anchor_links
+		if str(link_name).strip()
+	)
+	if target_rest_anchor_links:
+		link_indices = {link_name: idx for idx, link_name in enumerate(target_robot_links, start=1)}
+		semantic_child_to_link = {
+			child_body: link_name
+			for link_name, (_parent_body, child_body) in resolved_source_links.items()
+		}
+
+		def collect_descendant_links(root_link_name: str) -> tuple[str, ...]:
+			root_child = resolved_source_links[root_link_name][1]
+			descendants = [root_link_name]
+			frontier = [root_child]
+			while frontier:
+				parent_semantic = frontier.pop()
+				for candidate_name, (candidate_parent, candidate_child) in resolved_source_links.items():
+					if candidate_parent != parent_semantic:
+						continue
+					descendants.append(candidate_name)
+					frontier.append(candidate_child)
+			return tuple(descendants)
+
+		for link_name in target_rest_anchor_links:
+			if link_name not in target_robot_links:
+				raise ValueError(f"Unknown target_rest_anchor_links entry: {link_name}")
+			parent_semantic = resolved_source_links[link_name][0]
+			if parent_semantic == "hips_mean":
+				parent_idx = 0
+			else:
+				parent_link_name = semantic_child_to_link.get(parent_semantic)
+				if parent_link_name is None:
+					raise ValueError(
+						f"Could not resolve semantic parent '{parent_semantic}' for anchor link '{link_name}'"
+					)
+				parent_idx = link_indices[parent_link_name]
+
+			child_idx = link_indices[link_name]
+			start_body, end_body = target_robot_links[link_name]
+			local_rest_offset = compute_robot_body_local_offset(
+				target_robot_mjcf_path,
+				anchor_body=start_body,
+				target_body=end_body,
+			)
+			world_rest_offset = quat_rotate_vectors_wxyz(
+				ordered_raw_quaternions[:, parent_idx, :],
+				local_rest_offset,
+			)
+			desired_child_positions = ordered_keypoints[:, parent_idx, :] + world_rest_offset
+			translation = desired_child_positions - ordered_keypoints[:, child_idx, :]
+			for descendant_name in collect_descendant_links(link_name):
+				ordered_keypoints[:, link_indices[descendant_name], :] += translation
 
 	return (
 		ordered_keypoints,
@@ -912,6 +976,7 @@ def main() -> None:
 		target_robot_link_lengths=target_robot_link_lengths,
 		source_robot_config_path=source_robot_config_path,
 		target_robot_config_path=target_robot_config_path,
+		target_robot_mjcf_path=target_robot_mjcf_path,
 	)
 	knee_angle_offset_degrees = load_effective_knee_angle_offset_degrees(target_robot_config_path)
 	(
