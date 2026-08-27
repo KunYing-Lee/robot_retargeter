@@ -61,6 +61,7 @@ from smpl_replay import (
 	save_keypoints_pkl,
 	scale_keypoint_frame_displacements,
 	select_frame_slice,
+	slice_frame_aligned_arrays,
 	update_viewer_keypoints,
 )
 
@@ -1010,6 +1011,15 @@ def main() -> None:
 		contact_states=contact_states,
 		height_lpf_alpha=contact_height_lpf_alpha,
 	)
+	frame_ids = select_frame_slice(positions.shape[0], args.start_frame, args.end_frame, args.stride)
+	selected = slice_frame_aligned_arrays(
+		frame_ids,
+		positions=retarget_keypoints,
+		quaternions=retarget_keypoint_quaternions,
+		contact_positions=contact_positions,
+		contact_speeds=contact_speeds,
+		contact_states=contact_states,
+	)
 	keypoint_output_path = build_output_path(
 		output_path=args.output_path,
 		motion_file=motion_file,
@@ -1019,19 +1029,18 @@ def main() -> None:
 	save_keypoints_pkl(
 		output_path=keypoint_output_path,
 		keypoint_names=keypoint_names,
-		positions=retarget_keypoints,
-		quaternions=retarget_keypoint_quaternions,
+		positions=selected["positions"],
+		quaternions=selected["quaternions"],
 		fps=fps,
 		contact_names=contact_names,
-		contact_positions=contact_positions,
-		contact_speeds=contact_speeds,
-		contact_states=contact_states,
+		contact_positions=selected["contact_positions"],
+		contact_speeds=selected["contact_speeds"],
+		contact_states=selected["contact_states"],
 		contact_vel_window=contact_vel_window,
 		contact_vel_threshold=contact_vel_threshold,
 		contact_height_threshold=contact_height_threshold,
 	)
 
-	frame_ids = select_frame_slice(positions.shape[0], args.start_frame, args.end_frame, args.stride)
 	if args.print_summary:
 		print_robot_summary(
 			motion_file=motion_file,

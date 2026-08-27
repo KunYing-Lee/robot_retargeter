@@ -56,6 +56,18 @@ def parse_args() -> argparse.Namespace:
             "output_data/keypoints/<config_stem>/<name>_keypoints.pkl"
         ),
     )
+    parser.add_argument(
+        "--keypoints-path",
+        type=str,
+        default=None,
+        help="Explicit keypoint payload path. Mutually exclusive with --keypoints-name.",
+    )
+    parser.add_argument(
+        "--output-path",
+        type=str,
+        default=None,
+        help="Explicit output K1 qpos CSV path.",
+    )
     render_debug_group = parser.add_mutually_exclusive_group()
     render_debug_group.add_argument(
         "--render-debug",
@@ -863,6 +875,8 @@ if  __name__ == "__main__":
     keypoints_idx = config.get("keypoints_idx","")
 
     config_name = os.path.splitext(os.path.basename(config_path))[0]
+    if args.keypoints_name and args.keypoints_path:
+        raise ValueError("--keypoints-name and --keypoints-path are mutually exclusive")
     if args.keypoints_name:
         keypoints_path = os.path.join(
             "output_data",
@@ -870,6 +884,8 @@ if  __name__ == "__main__":
             config_name,
             f"{args.keypoints_name}_keypoints.pkl",
         )
+    elif args.keypoints_path:
+        keypoints_path = os.path.expanduser(args.keypoints_path)
 
     if robot_xml_path and not os.path.isabs(robot_xml_path):
         robot_xml_path = os.path.join(workspace_root, robot_xml_path)
@@ -909,7 +925,7 @@ if  __name__ == "__main__":
     keypoint_stem = os.path.splitext(os.path.basename(keypoints_path))[0]
     if keypoint_stem.endswith("_keypoints"):
         keypoint_stem = keypoint_stem[: -len("_keypoints")]
-    output_csv = os.path.join(
+    output_csv = os.path.expanduser(args.output_path) if args.output_path else os.path.join(
         workspace_root,
         "output_data/robot_motion",
         f"{keypoint_stem}_{config_name}.csv",
