@@ -36,6 +36,42 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PAUSED = False
 
 
+def compute_contact_grounding_offsets(
+    foot_bottom_heights,
+    foot_contact_states,
+    ground_height=0.0,
+):
+    """Solve vertical trajectory registration from contact equality constraints.
+
+    Frames with any source support anchor the target's physically lowest sole
+    exactly on the ground. Between anchors, the coordinate correction is
+    linearly interpolated; the unilateral floor constraint is imposed at every
+    frame. Foot identity remains an IK objective because root translation alone
+    cannot lower a higher active foot without penetrating a lower swing foot.
+    """
+    bottoms = np.asarray(foot_bottom_heights, dtype=np.float64)
+    contacts = np.asarray(foot_contact_states, dtype=bool)
+    if bottoms.ndim != 2 or contacts.shape != bottoms.shape:
+        raise ValueError(
+            "foot bottoms and contacts must have the same [frames, feet] shape"
+        )
+    if bottoms.shape[0] == 0 or bottoms.shape[1] == 0:
+        raise ValueError("grounding requires at least one frame and one foot")
+
+    lower_bound = float(ground_height) - np.min(bottoms, axis=1)
+    active_frames = np.flatnonzero(np.any(contacts, axis=1))
+    if active_frames.size == 0:
+        return np.maximum(np.zeros(bottoms.shape[0]), lower_bound)
+
+    anchor_offsets = lower_bound[active_frames]
+    interpolated = np.interp(
+        np.arange(bottoms.shape[0], dtype=np.float64),
+        active_frames.astype(np.float64),
+        anchor_offsets,
+    )
+    return np.maximum(interpolated, lower_bound)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Retarget keypoint motions to a robot from a YAML config."
@@ -114,6 +150,7 @@ class RobotRetarget:
         contact_position_cost: float = 10.0,
         posture_regularization: dict | None = None,
         ground_nonpenetration: dict | None = None,
+        contact_grounding: dict | None = None,
     ):
         self.xml_file = model_path
         self.keypoint_path = keypoint_path
@@ -128,6 +165,7 @@ class RobotRetarget:
         self.contact_position_cost = float(contact_position_cost)
         self.posture_regularization = posture_regularization or {}
         self.ground_nonpenetration = ground_nonpenetration or {}
+        self.contact_grounding = contact_grounding or {}
         self.verbose = verbose
         self.solver = solver
         self.human_body_to_task = {}
@@ -142,6 +180,7 @@ class RobotRetarget:
         self.motion_tasks = []
         self.active_tasks = []
         self.ground_contact_body_ids = []
+        self.ground_contact_geom_ids = []
         self.ground_root_z_qposadr = None
         self.ground_height = 0.0
         self.ground_tolerance = 1e-9
@@ -344,8 +383,13 @@ class RobotRetarget:
             return
 
         body_names = config.get("bodies", [])
-        if not isinstance(body_names, list) or not body_names:
-            raise ValueError("ground_nonpenetration.bodies must be a non-empty list")
+        geom_names = config.get("geoms", [])
+        if not isinstance(body_names, list) or not isinstance(geom_names, list):
+            raise TypeError("ground_nonpenetration bodies/geoms must be lists")
+        if not body_names and not geom_names:
+            raise ValueError(
+                "ground_nonpenetration requires a non-empty bodies or geoms list"
+            )
         for body_name in body_names:
             body_id = mujoco.mj_name2id(
                 self.model,
@@ -357,6 +401,22 @@ class RobotRetarget:
                     f"ground_nonpenetration body is absent from the target model: {body_name}"
                 )
             self.ground_contact_body_ids.append(int(body_id))
+        for geom_name in geom_names:
+            geom_id = mujoco.mj_name2id(
+                self.model,
+                mujoco.mjtObj.mjOBJ_GEOM,
+                str(geom_name),
+            )
+            if geom_id < 0:
+                raise ValueError(
+                    f"ground_nonpenetration geom is absent from the target model: {geom_name}"
+                )
+            if int(self.model.geom_type[geom_id]) != int(mujoco.mjtGeom.mjGEOM_BOX):
+                raise ValueError(
+                    "ground_nonpenetration currently requires exact box geoms, "
+                    f"got {geom_name}"
+                )
+            self.ground_contact_geom_ids.append(int(geom_id))
 
         free_joint_ids = np.flatnonzero(
             self.model.jnt_type == mujoco.mjtJoint.mjJNT_FREE
@@ -375,12 +435,10 @@ class RobotRetarget:
 
     def project_ground_nonpenetration(self):
         """Project root Z by the minimum displacement satisfying all sole constraints."""
-        if not self.ground_contact_body_ids:
+        if not self.ground_contact_body_ids and not self.ground_contact_geom_ids:
             return
         self.configuration.update()
-        minimum_height = float(
-            np.min(self.configuration.data.xpos[self.ground_contact_body_ids, 2])
-        )
+        minimum_height = self.minimum_ground_contact_height()
         correction = self.ground_height - minimum_height
         if correction <= self.ground_tolerance:
             return
@@ -388,9 +446,7 @@ class RobotRetarget:
         qpos = self.configuration.data.qpos.copy()
         qpos[self.ground_root_z_qposadr] += correction
         self.configuration.update(q=qpos)
-        projected_minimum = float(
-            np.min(self.configuration.data.xpos[self.ground_contact_body_ids, 2])
-        )
+        projected_minimum = self.minimum_ground_contact_height()
         if projected_minimum < self.ground_height - self.ground_tolerance:
             raise RuntimeError(
                 "Ground non-penetration projection failed: "
@@ -398,6 +454,119 @@ class RobotRetarget:
             )
         self.ground_projection_count += 1
         self.ground_max_projection = max(self.ground_max_projection, correction)
+
+    def minimum_ground_contact_height(self):
+        """Return the exact lowest configured body point or box-geom corner."""
+        heights = [
+            float(self.configuration.data.xpos[body_id, 2])
+            for body_id in self.ground_contact_body_ids
+        ]
+        for geom_id in self.ground_contact_geom_ids:
+            rotation = self.configuration.data.geom_xmat[geom_id].reshape(3, 3)
+            vertical_extent = float(
+                np.dot(np.abs(rotation[2]), self.model.geom_size[geom_id])
+            )
+            heights.append(
+                float(self.configuration.data.geom_xpos[geom_id, 2]) - vertical_extent
+            )
+        if not heights:
+            raise RuntimeError("No ground contact primitives are configured")
+        return min(heights)
+
+    def register_contact_ground_trajectory(self):
+        """Register solved root Z to source contacts without flattening flight."""
+        config = self.contact_grounding
+        if not config or not bool(config.get("enabled", False)):
+            return
+        geom_contact_names = config.get("geom_contact_names", {})
+        if not isinstance(geom_contact_names, dict) or not geom_contact_names:
+            raise ValueError(
+                "contact_grounding.geom_contact_names must be a non-empty mapping"
+            )
+
+        geom_ids = []
+        contact_columns = []
+        for geom_name, raw_contact_names in geom_contact_names.items():
+            geom_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, str(geom_name)
+            )
+            if geom_id < 0:
+                raise ValueError(f"contact_grounding geom not found: {geom_name}")
+            if int(self.model.geom_type[geom_id]) != int(mujoco.mjtGeom.mjGEOM_BOX):
+                raise ValueError(
+                    f"contact_grounding requires exact box geoms, got {geom_name}"
+                )
+            if not isinstance(raw_contact_names, list) or not raw_contact_names:
+                raise ValueError(
+                    f"contact_grounding contacts for {geom_name} must be a list"
+                )
+            columns = []
+            for contact_name in raw_contact_names:
+                column = self.contact_state_name_to_idx.get(str(contact_name))
+                if column is None:
+                    raise ValueError(
+                        f"contact_grounding source contact not found: {contact_name}"
+                    )
+                columns.append(int(column))
+            geom_ids.append(int(geom_id))
+            contact_columns.append(columns)
+
+        result = np.asarray(self.result_pos, dtype=np.float64)
+        data = mujoco.MjData(self.model)
+        bottoms = np.empty((len(result), len(geom_ids)), dtype=np.float64)
+        for frame, qpos in enumerate(result):
+            data.qpos[:] = qpos
+            mujoco.mj_forward(self.model, data)
+            for foot, geom_id in enumerate(geom_ids):
+                rotation = data.geom_xmat[geom_id].reshape(3, 3)
+                vertical_extent = float(
+                    np.dot(np.abs(rotation[2]), self.model.geom_size[geom_id])
+                )
+                bottoms[frame, foot] = (
+                    float(data.geom_xpos[geom_id, 2]) - vertical_extent
+                )
+
+        contacts = np.stack(
+            [
+                np.any(self.contact_seq[:, columns].astype(bool), axis=1)
+                for columns in contact_columns
+            ],
+            axis=1,
+        )
+        offsets = compute_contact_grounding_offsets(
+            bottoms,
+            contacts,
+            ground_height=self.ground_height,
+        )
+        result[:, self.ground_root_z_qposadr] += offsets
+        self.result_pos = [qpos.copy() for qpos in result]
+
+        registered_bottoms = bottoms + offsets[:, None]
+        minimum_height = float(np.min(registered_bottoms))
+        if minimum_height < self.ground_height - self.ground_tolerance:
+            raise RuntimeError(
+                "Contact grounding violated nonpenetration: "
+                f"minimum sole height={minimum_height:.3e}"
+            )
+        active_frames = np.any(contacts, axis=1)
+        active_minimum = np.min(registered_bottoms, axis=1)
+        maximum_contact_gap = (
+            float(np.max(active_minimum[active_frames] - self.ground_height))
+            if np.any(active_frames)
+            else 0.0
+        )
+        if maximum_contact_gap > self.ground_tolerance:
+            raise RuntimeError(
+                "Contact grounding failed to close the support gap: "
+                f"maximum gap={maximum_contact_gap:.3e}"
+            )
+        if self.verbose:
+            print(
+                "[contact grounding] "
+                f"active_frames={int(np.count_nonzero(active_frames))}/{len(result)} "
+                f"offset_range=[{float(np.min(offsets)):.6f}, "
+                f"{float(np.max(offsets)):.6f}] m"
+            )
 
     def setup_contact_targets(self):
         if not self.contact_body_names or not self.contact_state_name_to_idx:
@@ -827,12 +996,15 @@ class RobotRetarget:
         finally:
             if viewer is not None:
                 viewer.close()
-        if self.ground_contact_body_ids and self.verbose:
+        if (
+            self.ground_contact_body_ids or self.ground_contact_geom_ids
+        ) and self.verbose:
             print(
                 "[ground nonpenetration] "
                 f"projected_frames={self.ground_projection_count}/{self.num_frames} "
                 f"max_root_z_projection={self.ground_max_projection:.6f} m"
             )
+        self.register_contact_ground_trajectory()
     
     def save_results_as_csv(self, output_path):
         if len(self.result_pos) == 0:
@@ -905,6 +1077,7 @@ if  __name__ == "__main__":
     contact_position_cost = config.get("contact_pos_fixed_factor", 10.0)
     posture_regularization = config.get("posture_regularization", {})
     ground_nonpenetration = config.get("ground_nonpenetration", {})
+    contact_grounding = config.get("contact_grounding", {})
     
     robot_retarget = RobotRetarget(
         model_path=robot_xml_path,
@@ -918,6 +1091,7 @@ if  __name__ == "__main__":
         contact_position_cost=contact_position_cost,
         posture_regularization=posture_regularization,
         ground_nonpenetration=ground_nonpenetration,
+        contact_grounding=contact_grounding,
     )
 
     robot_retarget.retarget()

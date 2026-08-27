@@ -69,15 +69,25 @@ posture_regularization:
     Right_Elbow_Pitch: 0.5
     Right_Elbow_Yaw: 0.5
 
-# Enforce the physical floor as a unilateral kinematic constraint. Since root Z
-# translates every sole point equally, the solver-side projection is the unique
-# minimum displacement satisfying all four z_sole >= 0 inequalities.
+# Enforce the physical floor as a unilateral kinematic constraint. The exact
+# collision-box support height includes toe and heel corners under foot pitch;
+# root-Z projection is the unique minimum displacement satisfying both boxes.
 ground_nonpenetration:
   enabled: true
-  bodies: [left_foot_end_link, left_toe_link,
-           right_foot_end_link, right_toe_link]
+  geoms: [left_foot_collision, right_foot_collision]
   height: 0.0
   tolerance: 1.0e-9
+
+# Register the solved floating-base trajectory to G1's semantic support phases.
+# Frames with any support are equality anchors for the physically lowest K1
+# sole; flight-frame offsets interpolate between anchors and remain subject to
+# the unilateral collision-box floor constraint. Left/right contact identity
+# remains an IK objective rather than an infeasible root-translation constraint.
+contact_grounding:
+  enabled: true
+  geom_contact_names:
+    left_foot_collision: [left_foot_end, left_toe]
+    right_foot_collision: [right_foot_end, right_toe]
 
 ik_match_table: {
   "hips_mean": ["Trunk", 100, 5],
