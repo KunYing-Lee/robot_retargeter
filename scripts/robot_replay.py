@@ -1012,6 +1012,7 @@ def main() -> None:
 		height_lpf_alpha=contact_height_lpf_alpha,
 	)
 	frame_ids = select_frame_slice(positions.shape[0], args.start_frame, args.end_frame, args.stride)
+	export_fps = fps / args.stride
 	selected = slice_frame_aligned_arrays(
 		frame_ids,
 		positions=retarget_keypoints,
@@ -1031,7 +1032,7 @@ def main() -> None:
 		keypoint_names=keypoint_names,
 		positions=selected["positions"],
 		quaternions=selected["quaternions"],
-		fps=fps,
+		fps=export_fps,
 		contact_names=contact_names,
 		contact_positions=selected["contact_positions"],
 		contact_speeds=selected["contact_speeds"],

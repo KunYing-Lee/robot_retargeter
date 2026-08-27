@@ -2445,6 +2445,7 @@ def main() -> None:
 		f"{args.motion_file.expanduser().resolve().stem}_keypoints.pkl"
 	)
 	frame_ids = select_frame_slice(positions.shape[0], args.start_frame, args.end_frame, args.stride)
+	export_fps = inferred_fps / args.stride
 	selected = slice_frame_aligned_arrays(
 		frame_ids,
 		positions=retarget_keypoints,
@@ -2458,7 +2459,7 @@ def main() -> None:
 		keypoint_names=keypoint_names,
 		positions=selected["positions"],
 		quaternions=selected["quaternions"],
-		fps=inferred_fps,
+		fps=export_fps,
 		contact_names=contact_links,
 		contact_positions=selected["contact_positions"],
 		contact_speeds=selected["contact_speeds"],
