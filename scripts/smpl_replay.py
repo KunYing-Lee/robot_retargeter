@@ -1977,6 +1977,36 @@ def select_frame_slice(num_frames: int, start_frame: int, end_frame: int, stride
 	return np.arange(start, stop, stride, dtype=np.int32)
 
 
+def slice_frame_aligned_arrays(
+	frame_ids: np.ndarray,
+	**arrays: np.ndarray | None,
+) -> dict[str, np.ndarray | None]:
+	"""Select the same frames from synchronized motion arrays.
+
+	The replay CLIs expose one frame range for visualization and export.  Keeping
+	the selection in one helper prevents a sliced video from silently producing a
+	full-length keypoint payload.
+	"""
+	if frame_ids.ndim != 1 or frame_ids.size == 0:
+		raise ValueError("frame_ids must be a non-empty 1D array")
+	if np.any(frame_ids < 0):
+		raise ValueError("frame_ids must be non-negative")
+	last_frame = int(frame_ids[-1])
+	selected: dict[str, np.ndarray | None] = {}
+	for name, values in arrays.items():
+		if values is None:
+			selected[name] = None
+			continue
+		if values.ndim == 0:
+			raise ValueError(f"{name} must have a frame dimension")
+		if values.shape[0] <= last_frame:
+			raise ValueError(
+				f"{name} has {values.shape[0]} frames but selection includes {last_frame}"
+			)
+		selected[name] = values[frame_ids]
+	return selected
+
+
 def symmetrize_hip_joints(
 	positions: np.ndarray,
 	root_quaternions_wxyz: np.ndarray,
@@ -2414,16 +2444,26 @@ def main() -> None:
 	keypoint_output_path = Path("output_data/keypoints") / robot_config_path.stem / (
 		f"{args.motion_file.expanduser().resolve().stem}_keypoints.pkl"
 	)
-	save_keypoints_pkl(
-		output_path=keypoint_output_path,
-		keypoint_names=keypoint_names,
+	frame_ids = select_frame_slice(positions.shape[0], args.start_frame, args.end_frame, args.stride)
+	export_fps = inferred_fps / args.stride
+	selected = slice_frame_aligned_arrays(
+		frame_ids,
 		positions=retarget_keypoints,
 		quaternions=retarget_keypoint_quaternions,
-		fps=inferred_fps,
-		contact_names=contact_links,
 		contact_positions=contact_positions,
 		contact_speeds=contact_speeds,
 		contact_states=contact_states,
+	)
+	save_keypoints_pkl(
+		output_path=keypoint_output_path,
+		keypoint_names=keypoint_names,
+		positions=selected["positions"],
+		quaternions=selected["quaternions"],
+		fps=export_fps,
+		contact_names=contact_links,
+		contact_positions=selected["contact_positions"],
+		contact_speeds=selected["contact_speeds"],
+		contact_states=selected["contact_states"],
 		contact_vel_window=contact_vel_window,
 		contact_vel_threshold=contact_vel_threshold,
 		contact_height_threshold=contact_height_threshold,
@@ -2433,7 +2473,6 @@ def main() -> None:
 	if fps <= 0.0:
 		raise ValueError(f"Invalid playback fps: {fps}")
 
-	frame_ids = select_frame_slice(positions.shape[0], args.start_frame, args.end_frame, args.stride)
 	if args.print_summary:
 		print_summary(args.motion_file, positions, fps, gender, frame_ids)
 		print(f"contact_names: {list(contact_links)}")

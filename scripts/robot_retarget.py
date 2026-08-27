@@ -56,6 +56,18 @@ def parse_args() -> argparse.Namespace:
             "output_data/keypoints/<config_stem>/<name>_keypoints.pkl"
         ),
     )
+    parser.add_argument(
+        "--keypoints-path",
+        type=str,
+        default=None,
+        help="Explicit keypoint payload path. Mutually exclusive with --keypoints-name.",
+    )
+    parser.add_argument(
+        "--output-path",
+        type=str,
+        default=None,
+        help="Explicit output K1 qpos CSV path.",
+    )
     render_debug_group = parser.add_mutually_exclusive_group()
     render_debug_group.add_argument(
         "--render-debug",
@@ -100,6 +112,8 @@ class RobotRetarget:
         joints_limit_offset_degrees: dict | None = None,
         contact_body_names: list | tuple | dict | None = None,
         contact_position_cost: float = 10.0,
+        posture_regularization: dict | None = None,
+        ground_nonpenetration: dict | None = None,
     ):
         self.xml_file = model_path
         self.keypoint_path = keypoint_path
@@ -112,6 +126,8 @@ class RobotRetarget:
         self.joints_limit_offset_degrees = joints_limit_offset_degrees or {}
         self.contact_body_names = self._normalize_contact_body_names(contact_body_names)
         self.contact_position_cost = float(contact_position_cost)
+        self.posture_regularization = posture_regularization or {}
+        self.ground_nonpenetration = ground_nonpenetration or {}
         self.verbose = verbose
         self.solver = solver
         self.human_body_to_task = {}
@@ -123,10 +139,20 @@ class RobotRetarget:
         self.body_name_to_contact_task = {}
         self.contact_targets = []
         self.current_contact_points = []
+        self.motion_tasks = []
+        self.active_tasks = []
+        self.ground_contact_body_ids = []
+        self.ground_root_z_qposadr = None
+        self.ground_height = 0.0
+        self.ground_tolerance = 1e-9
+        self.ground_projection_count = 0
+        self.ground_max_projection = 0.0
 
         self.robot_motor_names = {}
 
         self.setup_retarget_configuration()
+        self.setup_posture_regularization()
+        self.setup_ground_nonpenetration()
         self.load_keypoints()
         self.setup_contact_targets()
 
@@ -265,7 +291,113 @@ class RobotRetarget:
                 self.tasks.append(task)
                 self.robot_frame_names.append(robot_frame)
                 self.task_errors[task] = []
-        pass
+
+        self.motion_tasks = list(self.tasks)
+        self.active_tasks = list(self.motion_tasks)
+
+    def setup_posture_regularization(self):
+        """Add an optional low-priority joint posture task.
+
+        Position/orientation tasks determine the retargeted motion.  A posture
+        task only resolves redundant or under-actuated joint solutions toward
+        the target model's neutral qpos, which is especially important for
+        robots with fewer arm DoFs than the source robot.
+        """
+        config = self.posture_regularization
+        if not config or not bool(config.get("enabled", False)):
+            return
+
+        joint_costs = config.get("joint_costs", {})
+        if not isinstance(joint_costs, dict) or not joint_costs:
+            raise ValueError("posture_regularization.joint_costs must be a non-empty mapping")
+
+        cost_vector = np.zeros(self.model.nv, dtype=np.float64)
+        for joint_name, raw_cost in joint_costs.items():
+            joint_id = mujoco.mj_name2id(
+                self.model,
+                mujoco.mjtObj.mjOBJ_JOINT,
+                str(joint_name),
+            )
+            if joint_id < 0:
+                raise ValueError(f"Posture regularization joint not found: {joint_name}")
+            cost = float(raw_cost)
+            if cost < 0.0:
+                raise ValueError(f"Posture regularization cost must be non-negative: {joint_name}")
+            cost_vector[self.model.jnt_dofadr[joint_id]] = cost
+
+        posture_task = mink.PostureTask(
+            self.model,
+            cost=cost_vector,
+            gain=float(config.get("gain", 1.0)),
+            lm_damping=float(config.get("lm_damping", 1.0)),
+        )
+        posture_task.set_target(self.model.qpos0)
+        self.tasks.append(posture_task)
+        self.motion_tasks.append(posture_task)
+        self.active_tasks.append(posture_task)
+        self.posture_task = posture_task
+
+    def setup_ground_nonpenetration(self):
+        """Configure the exact root-Z projection for a horizontal ground plane."""
+        config = self.ground_nonpenetration
+        if not config or not bool(config.get("enabled", False)):
+            return
+
+        body_names = config.get("bodies", [])
+        if not isinstance(body_names, list) or not body_names:
+            raise ValueError("ground_nonpenetration.bodies must be a non-empty list")
+        for body_name in body_names:
+            body_id = mujoco.mj_name2id(
+                self.model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                str(body_name),
+            )
+            if body_id < 0:
+                raise ValueError(
+                    f"ground_nonpenetration body is absent from the target model: {body_name}"
+                )
+            self.ground_contact_body_ids.append(int(body_id))
+
+        free_joint_ids = np.flatnonzero(
+            self.model.jnt_type == mujoco.mjtJoint.mjJNT_FREE
+        )
+        if free_joint_ids.size != 1:
+            raise ValueError(
+                "ground_nonpenetration requires exactly one floating-base free joint, "
+                f"found {free_joint_ids.size}"
+            )
+        free_qposadr = int(self.model.jnt_qposadr[int(free_joint_ids[0])])
+        self.ground_root_z_qposadr = free_qposadr + 2
+        self.ground_height = float(config.get("height", 0.0))
+        self.ground_tolerance = float(config.get("tolerance", 1e-9))
+        if self.ground_tolerance < 0.0:
+            raise ValueError("ground_nonpenetration.tolerance must be non-negative")
+
+    def project_ground_nonpenetration(self):
+        """Project root Z by the minimum displacement satisfying all sole constraints."""
+        if not self.ground_contact_body_ids:
+            return
+        self.configuration.update()
+        minimum_height = float(
+            np.min(self.configuration.data.xpos[self.ground_contact_body_ids, 2])
+        )
+        correction = self.ground_height - minimum_height
+        if correction <= self.ground_tolerance:
+            return
+
+        qpos = self.configuration.data.qpos.copy()
+        qpos[self.ground_root_z_qposadr] += correction
+        self.configuration.update(q=qpos)
+        projected_minimum = float(
+            np.min(self.configuration.data.xpos[self.ground_contact_body_ids, 2])
+        )
+        if projected_minimum < self.ground_height - self.ground_tolerance:
+            raise RuntimeError(
+                "Ground non-penetration projection failed: "
+                f"minimum sole height={projected_minimum:.3e}"
+            )
+        self.ground_projection_count += 1
+        self.ground_max_projection = max(self.ground_max_projection, correction)
 
     def setup_contact_targets(self):
         if not self.contact_body_names or not self.contact_state_name_to_idx:
@@ -443,6 +575,7 @@ class RobotRetarget:
         # Record the keypoint targets (pos, quat_wxyz) mapped to tasks for the current frame, for visualization
         self.current_targets = []
         self.current_contact_points = []
+        self.active_tasks = list(self.motion_tasks)
         for keypoint_name, task in self.human_body_to_task.items():
             target_pos, target_quat = self._get_target_pose(frame_idx, keypoint_name)
             task.set_target(mink.SE3.from_rotation_and_translation(mink.SO3(target_quat), target_pos))
@@ -460,20 +593,22 @@ class RobotRetarget:
         for contact_target in self.contact_targets:
             source_keypoint_name = contact_target["source_keypoint_name"]
             target_pos, is_active = self._get_contact_locked_position(frame_idx, contact_target)
-            if is_active:
-                _, target_quat = self._get_target_pose(frame_idx, source_keypoint_name)
-            else:
-                target_pos, target_quat = self._get_body_pose(contact_target["body_name"])
+            if not is_active:
+                continue
+
+            _, target_quat = self._get_target_pose(frame_idx, source_keypoint_name)
             contact_target["task"].set_target(
                 mink.SE3.from_rotation_and_translation(mink.SO3(target_quat), target_pos)
             )
-            if is_active:
-                self.current_contact_points.append(np.asarray(target_pos, dtype=np.float64))
+            self.active_tasks.append(contact_target["task"])
+            self.current_contact_points.append(np.asarray(target_pos, dtype=np.float64))
     
     def error(self):
+        if not self.active_tasks:
+            return 0.0
         return np.linalg.norm(
             np.concatenate(
-                [task.compute_error(self.configuration) for task in self.tasks]
+                [task.compute_error(self.configuration) for task in self.active_tasks]
             )
         )
     
@@ -644,7 +779,12 @@ class RobotRetarget:
                 dt = self.configuration.model.opt.timestep
 
                 vel = mink.solve_ik(
-                    self.configuration, self.tasks, dt, self.solver, self.damping, limits=self.ik_limits
+                    self.configuration,
+                    self.active_tasks,
+                    dt,
+                    self.solver,
+                    self.damping,
+                    limits=self.ik_limits,
                 )
                 self.configuration.integrate_inplace(vel, dt)
                 next_error = self.error()
@@ -653,11 +793,17 @@ class RobotRetarget:
                     curr_error = next_error
                     dt = self.configuration.model.opt.timestep
                     vel = mink.solve_ik(
-                        self.configuration, self.tasks, dt, self.solver, self.damping, limits=self.ik_limits
+                        self.configuration,
+                        self.active_tasks,
+                        dt,
+                        self.solver,
+                        self.damping,
+                        limits=self.ik_limits,
                     )
                     self.configuration.integrate_inplace(vel, dt)
                     next_error = self.error()
                     num_iter += 1
+                self.project_ground_nonpenetration()
                 curr_pos = self.configuration.data.qpos.copy()
                 self.result_pos.append(curr_pos)
 
@@ -681,6 +827,12 @@ class RobotRetarget:
         finally:
             if viewer is not None:
                 viewer.close()
+        if self.ground_contact_body_ids and self.verbose:
+            print(
+                "[ground nonpenetration] "
+                f"projected_frames={self.ground_projection_count}/{self.num_frames} "
+                f"max_root_z_projection={self.ground_max_projection:.6f} m"
+            )
     
     def save_results_as_csv(self, output_path):
         if len(self.result_pos) == 0:
@@ -723,6 +875,8 @@ if  __name__ == "__main__":
     keypoints_idx = config.get("keypoints_idx","")
 
     config_name = os.path.splitext(os.path.basename(config_path))[0]
+    if args.keypoints_name and args.keypoints_path:
+        raise ValueError("--keypoints-name and --keypoints-path are mutually exclusive")
     if args.keypoints_name:
         keypoints_path = os.path.join(
             "output_data",
@@ -730,6 +884,8 @@ if  __name__ == "__main__":
             config_name,
             f"{args.keypoints_name}_keypoints.pkl",
         )
+    elif args.keypoints_path:
+        keypoints_path = os.path.expanduser(args.keypoints_path)
 
     if robot_xml_path and not os.path.isabs(robot_xml_path):
         robot_xml_path = os.path.join(workspace_root, robot_xml_path)
@@ -747,6 +903,8 @@ if  __name__ == "__main__":
             for field_name in RobotRetarget.LEGACY_CONTACT_CONFIG_TO_NAMES
         }
     contact_position_cost = config.get("contact_pos_fixed_factor", 10.0)
+    posture_regularization = config.get("posture_regularization", {})
+    ground_nonpenetration = config.get("ground_nonpenetration", {})
     
     robot_retarget = RobotRetarget(
         model_path=robot_xml_path,
@@ -758,6 +916,8 @@ if  __name__ == "__main__":
         joints_limit_offset_degrees=joints_limit_offset_degrees,
         contact_body_names=contact_body_names,
         contact_position_cost=contact_position_cost,
+        posture_regularization=posture_regularization,
+        ground_nonpenetration=ground_nonpenetration,
     )
 
     robot_retarget.retarget()
@@ -765,7 +925,7 @@ if  __name__ == "__main__":
     keypoint_stem = os.path.splitext(os.path.basename(keypoints_path))[0]
     if keypoint_stem.endswith("_keypoints"):
         keypoint_stem = keypoint_stem[: -len("_keypoints")]
-    output_csv = os.path.join(
+    output_csv = os.path.expanduser(args.output_path) if args.output_path else os.path.join(
         workspace_root,
         "output_data/robot_motion",
         f"{keypoint_stem}_{config_name}.csv",
