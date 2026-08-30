@@ -230,7 +230,8 @@ $$
 > 说明：
 > - 缩放沿「父关键点 → 子关键点」逐段进行，子关键点位置由父关键点加上「原方向向量 × 缩放系数」得到，因此只改变长度、不改变朝向。
 > - 缩放系数是**逐帧**计算的（`link_scale_is_static = False`），可适应源骨架长度随姿态的细微变化。
-> - 此外，整体的根节点（root）平移还会按腿长比例缩放（`compute_leg_displacement_scale` / `scale_keypoint_frame_displacements`），使步幅与机器人腿长匹配。
+> - 默认情况下，整体的根节点（root）平移会按腿长比例缩放（`compute_leg_displacement_scale` / `scale_keypoint_frame_displacements`），使步幅与机器人腿长匹配。机器人配置可通过 `root_displacement_scaling` 为每个世界坐标轴选择 `preserve_source` 或 `leg_length`；这样可以在形态重定向时严格保留源机器人的水平世界轨迹，同时继续按腿长缩放竖直运动。
+> - 机器人到机器人的 replay 会把源 root 坐标写入 keypoint payload。目标机器人配置可为指定坐标轴启用 `root_trajectory_constraint`；这些坐标会在整个 IK 过程中作为仿射等式约束执行，而不是导出后的修补。
 
 #### Root 缩放
 
@@ -337,4 +338,3 @@ $$
 3. 该约束以额外 `FrameTask` 形式加入优化，权重由 `contact_pos_fixed_factor` 控制。
 
 这样可以显著减小支撑相内的足端漂移（foot sliding），同时在摆动相保持动作自由度。
-

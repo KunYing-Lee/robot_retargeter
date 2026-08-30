@@ -10,6 +10,21 @@ joints_limit_offset_degrees: {}
 knee_angle_offset_degrees: 0.0
 enable_knee_angle_offset_degrees: false
 
+# Preserve G1's world-frame horizontal trajectory exactly. Morphology scaling
+# remains appropriate for vertical motion, after which contact grounding places
+# the K1 soles on the physical floor.
+root_displacement_scaling:
+  x: preserve_source
+  y: preserve_source
+  z: leg_length
+
+# Treat the source robot's world-frame horizontal root coordinates as exact IK
+# equality constraints. This prevents soft body/contact tasks from shrinking
+# the commanded trajectory after replay has preserved it.
+root_trajectory_constraint:
+  enabled: true
+  axes: [x, y]
+
 # Semantic source links are represented by pairs of K1 body frames.  The
 # shoulder and arm endpoints match the G1 source semantics used by
 # robot_replay.py; K1's head is held by its two target head frames because the

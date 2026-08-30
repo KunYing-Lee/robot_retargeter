@@ -1184,18 +1184,23 @@ def compute_leg_displacement_scale(
 
 def scale_keypoint_frame_displacements(
 	keypoints: np.ndarray,
-	displacement_scale: float,
+	displacement_scale: float | np.ndarray,
 	root_keypoint_idx: int = 0,
 ) -> np.ndarray:
 	if keypoints.ndim != 3 or keypoints.shape[-1] != 3:
 		raise ValueError(f"keypoints shape must be [T, K, 3], got {keypoints.shape}")
-	if displacement_scale <= 0.0:
-		raise ValueError(f"displacement_scale must be positive, got {displacement_scale}")
+	scale = np.asarray(displacement_scale, dtype=np.float32)
+	if scale.ndim == 0:
+		scale = np.repeat(scale, 3)
+	if scale.shape != (3,):
+		raise ValueError(f"displacement_scale must be a scalar or length-3 vector, got {scale.shape}")
+	if np.any(scale <= 0.0):
+		raise ValueError(f"displacement_scale must be positive, got {scale}")
 	if root_keypoint_idx < 0 or root_keypoint_idx >= keypoints.shape[1]:
 		raise ValueError(
 			f"root_keypoint_idx must be within [0, {keypoints.shape[1]}), got {root_keypoint_idx}"
 		)
-	if keypoints.shape[0] <= 1 or np.isclose(displacement_scale, 1.0):
+	if keypoints.shape[0] <= 1 or np.allclose(scale, 1.0):
 		return keypoints.astype(np.float32, copy=True)
 
 	root_positions = keypoints[:, root_keypoint_idx, :].astype(np.float32)
@@ -1203,11 +1208,48 @@ def scale_keypoint_frame_displacements(
 	scaled_root_positions = np.empty_like(root_positions, dtype=np.float32)
 	scaled_root_positions[0] = root_positions[0]
 	scaled_root_positions[1:] = scaled_root_positions[0:1] + np.cumsum(
-		(displacement_scale * root_frame_deltas).astype(np.float32),
+		(scale * root_frame_deltas).astype(np.float32),
 		axis=0,
 	)
 	translation_offsets = scaled_root_positions - root_positions
 	return (keypoints + translation_offsets[:, None, :]).astype(np.float32)
+
+
+def load_root_displacement_scale(
+	config_path: Path,
+	leg_displacement_scale: float,
+) -> tuple[np.ndarray, tuple[str, str, str]]:
+	"""Resolve per-axis root displacement scaling from a robot config.
+
+	Each world axis may either preserve the source trajectory or scale it by the
+	target/source leg-length ratio. Missing configuration keeps the historical
+	uniform leg-length scaling behavior.
+	"""
+	with config_path.open("r", encoding="utf-8") as f:
+		config = yaml.safe_load(f) or {}
+	raw_modes = config.get(
+		"root_displacement_scaling",
+		{"x": "leg_length", "y": "leg_length", "z": "leg_length"},
+	)
+	if not isinstance(raw_modes, dict):
+		raise ValueError(f"root_displacement_scaling must be a mapping in: {config_path}")
+
+	modes: list[str] = []
+	scales: list[float] = []
+	for axis in ("x", "y", "z"):
+		mode = raw_modes.get(axis, "leg_length")
+		if mode == "preserve_source":
+			scale = 1.0
+		elif mode == "leg_length":
+			scale = float(leg_displacement_scale)
+		else:
+			raise ValueError(
+				f"root_displacement_scaling.{axis} must be 'preserve_source' or "
+				f"'leg_length', got {mode!r} in: {config_path}"
+			)
+		modes.append(mode)
+		scales.append(scale)
+	return np.asarray(scales, dtype=np.float32), tuple(modes)
 
 
 def apply_link_scales_to_positions(
@@ -2154,6 +2196,7 @@ def save_keypoints_pkl(
 	contact_vel_window: int | None = None,
 	contact_vel_threshold: float | None = None,
 	contact_height_threshold: float | None = None,
+	source_root_positions: np.ndarray | None = None,
 ) -> None:
 	output_path.parent.mkdir(parents=True, exist_ok=True)
 	payload = {
@@ -2171,6 +2214,14 @@ def save_keypoints_pkl(
 	# 	payload["contact_speeds"] = contact_speeds.astype(np.float32)
 	if contact_states is not None:
 		payload["contact_states"] = contact_states.astype(np.bool_)
+	if source_root_positions is not None:
+		source_root_positions = np.asarray(source_root_positions, dtype=np.float32)
+		if source_root_positions.shape != (positions.shape[0], 3):
+			raise ValueError(
+				"source_root_positions must have shape "
+				f"({positions.shape[0]}, 3), got {source_root_positions.shape}"
+			)
+		payload["source_root_positions"] = source_root_positions
 	# if contact_vel_window is not None:
 	# 	payload["contact_vel_window"] = int(contact_vel_window)
 	# if contact_vel_threshold is not None:
@@ -2427,9 +2478,13 @@ def main() -> None:
 		skeleton_link_vectors=skeleton_link_vectors,
 		knee_angle_offset_degrees=knee_angle_offset_degrees,
 	)
+	root_displacement_scale, root_displacement_scaling = load_root_displacement_scale(
+		robot_config_path,
+		leg_displacement_scale,
+	)
 	retarget_keypoints = scale_keypoint_frame_displacements(
 		keypoints=retarget_keypoints,
-		displacement_scale=leg_displacement_scale,
+		displacement_scale=root_displacement_scale,
 		root_keypoint_idx=0,
 	)
 	keypoint_names = ["hips_mean", *list(robot_links.keys()), *extra_keypoint_names]
@@ -2482,6 +2537,8 @@ def main() -> None:
 		print(f"robot_leg_length: {robot_leg_length}")
 		print(f"skeleton_leg_length: {skeleton_leg_length}")
 		print(f"leg_displacement_scale: {leg_displacement_scale}")
+		print(f"root_displacement_scaling: {root_displacement_scaling}")
+		print(f"root_displacement_scale: {root_displacement_scale}")
 		print(f"keypoints_pkl: {keypoint_output_path}")
 		print(f"robot_mjcf_path: {robot_mjcf_path}")
 		print(f"robot_link_lengths: {robot_link_lengths}")

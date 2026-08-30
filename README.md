@@ -230,7 +230,8 @@ Here, $L_i^{\text{robot}}$ is the fixed robot link length, $\mathbf{x}$ is the o
 > Notes:
 > - Scaling is applied segment by segment from parent to child. Child position is parent + (original direction vector x scale factor), so only length changes while direction is preserved.
 > - Scale factors are computed **per frame** (`link_scale_is_static = False`), adapting to subtle pose-dependent source-length changes.
-> - In addition, root translation is scaled by leg-length ratio (`compute_leg_displacement_scale` / `scale_keypoint_frame_displacements`) to better match stride scale.
+> - By default, root translation is scaled by leg-length ratio (`compute_leg_displacement_scale` / `scale_keypoint_frame_displacements`) to better match stride scale. A robot config may set `root_displacement_scaling` per world axis to `preserve_source` or `leg_length`. This lets a morphology retarget preserve an input robot's horizontal world trajectory while retaining leg-scaled vertical motion.
+> - Robot-to-robot replay stores the source root coordinates in the keypoint payload. A target config can enable `root_trajectory_constraint` for selected axes; these coordinates are then enforced as affine equality constraints throughout IK rather than as a post-export correction.
 
 #### Root scaling
 

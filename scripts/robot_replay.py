@@ -54,6 +54,7 @@ from smpl_replay import (
 	iter_progress,
 	load_key_frame_config,
 	load_path_config,
+	load_root_displacement_scale,
 	load_robot_links_config,
 	load_scalar_float_config,
 	load_scalar_int_config,
@@ -997,9 +998,13 @@ def main() -> None:
 		skeleton_link_vectors=source_link_vectors,
 		knee_angle_offset_degrees=knee_angle_offset_degrees,
 	)
+	root_displacement_scale, root_displacement_scaling = load_root_displacement_scale(
+		target_robot_config_path,
+		leg_displacement_scale,
+	)
 	retarget_keypoints = scale_keypoint_frame_displacements(
 		keypoints=retarget_keypoints,
-		displacement_scale=leg_displacement_scale,
+		displacement_scale=root_displacement_scale,
 		root_keypoint_idx=0,
 	)
 	keypoint_names = ["hips_mean", *list(target_robot_links.keys()), *extra_keypoint_names]
@@ -1020,6 +1025,7 @@ def main() -> None:
 		contact_positions=contact_positions,
 		contact_speeds=contact_speeds,
 		contact_states=contact_states,
+		source_root_positions=qpos_frames[:, :3],
 	)
 	keypoint_output_path = build_output_path(
 		output_path=args.output_path,
@@ -1037,6 +1043,7 @@ def main() -> None:
 		contact_positions=selected["contact_positions"],
 		contact_speeds=selected["contact_speeds"],
 		contact_states=selected["contact_states"],
+		source_root_positions=selected["source_root_positions"],
 		contact_vel_window=contact_vel_window,
 		contact_vel_threshold=contact_vel_threshold,
 		contact_height_threshold=contact_height_threshold,
@@ -1059,6 +1066,8 @@ def main() -> None:
 		print(f"robot_leg_length: {robot_leg_length}")
 		print(f"source_leg_length: {source_leg_length}")
 		print(f"leg_displacement_scale: {leg_displacement_scale}")
+		print(f"root_displacement_scaling: {root_displacement_scaling}")
+		print(f"root_displacement_scale: {root_displacement_scale}")
 		print(f"source_robot_mjcf_path: {source_robot_mjcf_path}")
 		print(f"target_robot_mjcf_path: {target_robot_mjcf_path}")
 		print(f"target_robot_link_lengths: {target_robot_link_lengths}")

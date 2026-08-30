@@ -72,6 +72,25 @@ def compute_contact_grounding_offsets(
     return np.maximum(interpolated, lower_bound)
 
 
+def project_root_trajectory_axes(qpos, source_root_position, free_qposadr, axes):
+    """Project a floating base onto exact source world-trajectory coordinates."""
+    axis_indices = {"x": 0, "y": 1, "z": 2}
+    projected = np.asarray(qpos, dtype=np.float64).copy()
+    source = np.asarray(source_root_position, dtype=np.float64)
+    if source.shape != (3,):
+        raise ValueError(f"source_root_position must have shape (3,), got {source.shape}")
+    if not axes:
+        raise ValueError("root trajectory constraint requires at least one axis")
+    if len(set(axes)) != len(axes):
+        raise ValueError(f"root trajectory constraint axes must be unique, got {axes}")
+    for axis in axes:
+        if axis not in axis_indices:
+            raise ValueError(f"root trajectory constraint axis must be x/y/z, got {axis!r}")
+        index = axis_indices[axis]
+        projected[int(free_qposadr) + index] = source[index]
+    return projected
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Retarget keypoint motions to a robot from a YAML config."
@@ -151,6 +170,7 @@ class RobotRetarget:
         posture_regularization: dict | None = None,
         ground_nonpenetration: dict | None = None,
         contact_grounding: dict | None = None,
+        root_trajectory_constraint: dict | None = None,
     ):
         self.xml_file = model_path
         self.keypoint_path = keypoint_path
@@ -166,6 +186,7 @@ class RobotRetarget:
         self.posture_regularization = posture_regularization or {}
         self.ground_nonpenetration = ground_nonpenetration or {}
         self.contact_grounding = contact_grounding or {}
+        self.root_trajectory_constraint = root_trajectory_constraint or {}
         self.verbose = verbose
         self.solver = solver
         self.human_body_to_task = {}
@@ -186,6 +207,9 @@ class RobotRetarget:
         self.ground_tolerance = 1e-9
         self.ground_projection_count = 0
         self.ground_max_projection = 0.0
+        self.root_trajectory_qposadr = None
+        self.root_trajectory_axes = ()
+        self.source_root_positions = None
 
         self.robot_motor_names = {}
 
@@ -193,6 +217,7 @@ class RobotRetarget:
         self.setup_posture_regularization()
         self.setup_ground_nonpenetration()
         self.load_keypoints()
+        self.setup_root_trajectory_constraint()
         self.setup_contact_targets()
 
     def _normalize_contact_body_names(self, contact_body_names):
@@ -296,10 +321,68 @@ class RobotRetarget:
             contact_name: idx for idx, contact_name in enumerate(self.contact_names)
         }
         self.contact_seq = keypoints_data["contact_states"]
+        self.source_root_positions = keypoints_data.get("source_root_positions")
         self.fps = keypoints_data.get("fps", 30)
         self.time_step = 1.0 / self.fps
         self.num_frames = self.keypoints_pos.shape[0]
         self.num_keypoints = self.keypoints_pos.shape[1]
+
+    def setup_root_trajectory_constraint(self):
+        """Configure exact floating-base trajectory axes carried by robot replay."""
+        config = self.root_trajectory_constraint
+        if not config or not bool(config.get("enabled", False)):
+            return
+        axes = config.get("axes", [])
+        if not isinstance(axes, list):
+            raise TypeError("root_trajectory_constraint.axes must be a list")
+        if "z" in axes and (
+            self.ground_contact_body_ids or self.ground_contact_geom_ids
+        ):
+            raise ValueError(
+                "root_trajectory_constraint on z conflicts with ground_nonpenetration"
+            )
+        if self.source_root_positions is None:
+            raise ValueError(
+                "root_trajectory_constraint requires source_root_positions in the keypoint payload"
+            )
+        source_root_positions = np.asarray(self.source_root_positions, dtype=np.float64)
+        if source_root_positions.shape != (self.num_frames, 3):
+            raise ValueError(
+                "source_root_positions must match the keypoint frame count, got "
+                f"{source_root_positions.shape} for {self.num_frames} frames"
+            )
+        if not np.isfinite(source_root_positions).all():
+            raise ValueError("source_root_positions contains non-finite values")
+        free_joint_ids = np.flatnonzero(
+            self.model.jnt_type == mujoco.mjtJoint.mjJNT_FREE
+        )
+        if free_joint_ids.size != 1:
+            raise ValueError(
+                "root_trajectory_constraint requires exactly one floating-base free joint, "
+                f"found {free_joint_ids.size}"
+            )
+        free_qposadr = int(self.model.jnt_qposadr[int(free_joint_ids[0])])
+        project_root_trajectory_axes(
+            self.configuration.data.qpos,
+            source_root_positions[0],
+            free_qposadr,
+            axes,
+        )
+        self.root_trajectory_qposadr = free_qposadr
+        self.root_trajectory_axes = tuple(axes)
+        self.source_root_positions = source_root_positions
+
+    def project_root_trajectory(self, frame_idx):
+        """Apply the configured affine equality before evaluating the IK state."""
+        if self.root_trajectory_qposadr is None:
+            return
+        qpos = project_root_trajectory_axes(
+            self.configuration.data.qpos,
+            self.source_root_positions[frame_idx],
+            self.root_trajectory_qposadr,
+            self.root_trajectory_axes,
+        )
+        self.configuration.update(q=qpos)
 
     def setup_retarget_configuration(self):
         self.configuration = mink.Configuration(self.model)
@@ -956,6 +1039,7 @@ class RobotRetarget:
                     limits=self.ik_limits,
                 )
                 self.configuration.integrate_inplace(vel, dt)
+                self.project_root_trajectory(frame_idx)
                 next_error = self.error()
                 num_iter = 0
                 while curr_error - next_error > 0.001 and num_iter < self.max_iter:
@@ -970,6 +1054,7 @@ class RobotRetarget:
                         limits=self.ik_limits,
                     )
                     self.configuration.integrate_inplace(vel, dt)
+                    self.project_root_trajectory(frame_idx)
                     next_error = self.error()
                     num_iter += 1
                 self.project_ground_nonpenetration()
@@ -1092,6 +1177,7 @@ if  __name__ == "__main__":
         posture_regularization=posture_regularization,
         ground_nonpenetration=ground_nonpenetration,
         contact_grounding=contact_grounding,
+        root_trajectory_constraint=config.get("root_trajectory_constraint", {}),
     )
 
     robot_retarget.retarget()
